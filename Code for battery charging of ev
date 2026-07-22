@@ -1,0 +1,59 @@
+const int batteryPin = 34;
+const int ledPin = 19;
+
+// Voltage divider
+const float R1 = 100000.0;
+const float R2 = 33000.0;
+// ADC settings
+const float ADC_REF = 3.3;
+const float ADC_MAX = 4095.0;
+
+float readBatteryVoltage() {
+  long total = 0;
+  const int samples = 50;
+
+  for (int i = 0; i < samples; i++) {
+    total += analogRead(batteryPin);
+    delay(5);
+  }
+
+  float rawAverage = total / (float)samples;
+  float senseVoltage = (rawAverage / ADC_MAX) * ADC_REF;
+  float batteryVoltage = senseVoltage * ((R1 + R2) / R2);
+
+  return batteryVoltage;
+}
+
+int batteryPercent(float voltage) {
+  if (voltage >= 12.6) return 100;
+  if (voltage >= 12.4) return 90;
+  if (voltage >= 12.2) return 80;
+  if (voltage >= 12.0) return 70;
+  if (voltage >= 11.8) return 60;
+  if (voltage >= 11.5) return 50;
+  if (voltage >= 11.2) return 40;
+  if (voltage >= 10.9) return 30;
+  if (voltage >= 10.6) return 20;
+  if (voltage >= 10.2) return 10;
+  if (voltage >= 9.6)  return 5;
+  return 0;
+}
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+  pinMode(ledPin, OUTPUT);
+}
+void loop() {
+  float batteryVoltage = readBatteryVoltage();
+  int percent = batteryPercent(batteryVoltage);
+  // LED ON when battery is low
+  digitalWrite(ledPin, batteryVoltage < 10.2 ? HIGH : LOW);
+
+  Serial.print("Battery Voltage: ");
+  Serial.print(batteryVoltage, 2);
+  Serial.print(" V  |  Battery Percentage: ");
+  Serial.print(percent);
+  Serial.println("%");
+
+  delay(1000);
+}
