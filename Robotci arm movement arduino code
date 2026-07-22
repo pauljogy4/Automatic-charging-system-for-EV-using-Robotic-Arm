@@ -1,0 +1,276 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+const char* ssid = "realme 8";
+const char* password = "8129635023";
+
+WebServer server(80);
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
+
+// ================= SERVO LIMITS =================
+#define BASE_MIN 150
+#define BASE_MAX 550
+
+#define SHOULDER_MIN 150
+#define SHOULDER_MAX 500
+
+#define ELBOW_MIN 220
+#define ELBOW_MAX 500
+
+#define ACT_MIN 150
+#define ACT_MAX 600
+
+// ================= CHANNELS =================
+int baseCH = 0;
+int shoulderCH = 1;
+int elbowCH = 2;
+int actuatorCH = 3;
+
+// ================= BASE CONTROL =================
+int baseAngle = 90;
+int sweepDir = 1;
+
+int scanMin = 40;
+int scanMax = 140;
+
+// ================= ACTUATOR =================
+int actuatorCurrentAngle = 90;
+
+// ================= TIMING =================
+unsigned long shoulderDelayMs = 7000;
+unsigned long elbowDelayMs = 7000;
+unsigned long beforeAlignDelayMs = 2000;
+unsigned long beforeActuatorDelayMs = 3000;
+unsigned long baseMoveInterval = 180;
+
+unsigned long stageStartTime = 0;
+unsigned long lastBaseMoveTime = 0;
+
+// ================= ALIGNMENT =================
+int centerTol = 10;
+int stableCount = 0;
+int stableNeeded = 5;
+
+// ================= STATES =================
+enum Stage {
+  SHOULDER_STAGE,
+  SHOULDER_WAIT_STAGE,
+  ELBOW_STAGE,
+  ELBOW_WAIT_STAGE,
+  BEFORE_ALIGN_STAGE,
+  ALIGN_STAGE,
+  BEFORE_ACTUATOR_STAGE,
+  ACTUATOR_STAGE,
+  DONE_STAGE
+};
+
+Stage currentStage = SHOULDER_STAGE;
+
+// ================= UTIL =================
+int angleToPulse(int angle, int minVal, int maxVal) {
+  return map(angle, 0, 180, minVal, maxVal);
+}
+
+void setBaseAngle(int angle) {
+  angle = constrain(angle, scanMin, scanMax);
+  baseAngle = angle;
+  pwm.setPWM(baseCH, 0, angleToPulse(baseAngle, BASE_MIN, BASE_MAX));
+
+  Serial.print("Base Angle: ");
+  Serial.println(baseAngle);
+}
+
+void disableBase() {
+  pwm.setPWM(baseCH, 0, 0);
+}
+
+void setShoulderAngle(int angle) {
+  pwm.setPWM(shoulderCH, 0, angleToPulse(angle, SHOULDER_MIN, SHOULDER_MAX));
+  Serial.print("Shoulder -> ");
+  Serial.println(angle);
+}
+
+void setElbowAngle(int angle) {
+  pwm.setPWM(elbowCH, 0, angleToPulse(angle, ELBOW_MIN, ELBOW_MAX));
+  Serial.print("Elbow -> ");
+  Serial.println(angle);
+}
+
+void setActuatorAngle(int angle) {
+  pwm.setPWM(actuatorCH, 0, angleToPulse(angle, ACT_MIN, ACT_MAX));
+  Serial.print("Actuator -> ");
+  Serial.println(angle);
+}
+
+void moveActuatorSlowToZero() {
+  Serial.println("Actuator moving slowly to 0...");
+  for (int angle = actuatorCurrentAngle; angle >= 0; angle--) {
+    setActuatorAngle(angle);
+    delay(300);
+  }
+  actuatorCurrentAngle = 0;
+  Serial.println("Insertion complete");
+}
+
+// ================= CONTROL FROM CAMERA =================
+void handleControl() {
+  if (!server.hasArg("error")) {
+    server.send(400, "text/plain", "Missing error");
+    return;
+  }
+
+  if (currentStage != ALIGN_STAGE) {
+    server.send(200, "text/plain", "IGNORED");
+    return;
+  }
+
+  int errorX = server.arg("error").toInt();
+
+  if (millis() - lastBaseMoveTime < baseMoveInterval) {
+    server.send(200, "text/plain", "WAIT");
+    return;
+  }
+
+  lastBaseMoveTime = millis();
+
+  Serial.print("Error: ");
+  Serial.println(errorX);
+
+  // ================= SEARCH MODE =================
+  if (errorX == 9999) {
+    stableCount = 0;
+
+    baseAngle += sweepDir * 2;
+
+    if (baseAngle >= scanMax) {
+      baseAngle = scanMax;
+      sweepDir = -1;
+    } 
+    else if (baseAngle <= scanMin) {
+      baseAngle = scanMin;
+      sweepDir = 1;
+    }
+
+    setBaseAngle(baseAngle);
+    server.send(200, "text/plain", "SEARCHING");
+    return;
+  }
+
+  // ================= ALIGN MODE =================
+  if (abs(errorX) <= centerTol) {
+    stableCount++;
+    setBaseAngle(baseAngle);
+
+    Serial.print("Stable count: ");
+    Serial.println(stableCount);
+
+    if (stableCount >= stableNeeded) {
+      Serial.println("Alignment DONE");
+      currentStage = BEFORE_ACTUATOR_STAGE;
+      stageStartTime = millis();
+    }
+
+    server.send(200, "text/plain", "CENTER");
+    return;
+  }
+
+  stableCount = 0;
+
+  // Corrected left-right response
+  if (errorX < -centerTol) {
+    setBaseAngle(baseAngle + 1);   // if wrong direction, swap these two lines
+  } 
+  else if (errorX > centerTol) {
+    setBaseAngle(baseAngle - 1);   // if wrong direction, swap these two lines
+  }
+
+  server.send(200, "text/plain", "MOVING");
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  pwm.begin();
+  pwm.setPWMFreq(50);
+  delay(1000);
+
+  disableBase();
+  setActuatorAngle(actuatorCurrentAngle);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+
+  Serial.println("Connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  server.on("/control", handleControl);
+  server.begin();
+
+  stageStartTime = millis();
+}
+
+// ================= LOOP =================
+void loop() {
+  server.handleClient();
+
+  if (currentStage != ALIGN_STAGE) {
+    disableBase();
+  }
+
+  switch (currentStage) {
+    case SHOULDER_STAGE:
+      setShoulderAngle(119);
+      currentStage = SHOULDER_WAIT_STAGE;
+      stageStartTime = millis();
+      break;
+
+    case SHOULDER_WAIT_STAGE:
+      if (millis() - stageStartTime >= shoulderDelayMs) {
+        currentStage = ELBOW_STAGE;
+      }
+      break;
+
+    case ELBOW_STAGE:
+      setElbowAngle(87);
+      currentStage = ELBOW_WAIT_STAGE;
+      stageStartTime = millis();
+      break;
+
+    case ELBOW_WAIT_STAGE:
+      if (millis() - stageStartTime >= elbowDelayMs) {
+        currentStage = BEFORE_ALIGN_STAGE;
+        stageStartTime = millis();
+      }
+      break;
+
+    case BEFORE_ALIGN_STAGE:
+      if (millis() - stageStartTime >= beforeAlignDelayMs) {
+        pwm.setPWM(baseCH, 0, angleToPulse(baseAngle, BASE_MIN, BASE_MAX));
+        currentStage = ALIGN_STAGE;
+      }
+      break;
+
+    case ALIGN_STAGE:
+      break;
+
+    case BEFORE_ACTUATOR_STAGE:
+      if (millis() - stageStartTime >= beforeActuatorDelayMs) {
+        currentStage = ACTUATOR_STAGE;
+      }
+      break;
+
+    case ACTUATOR_STAGE:
+      moveActuatorSlowToZero();
+      currentStage = DONE_STAGE;
+      break;
+
+    case DONE_STAGE:
+      break;
+  }
