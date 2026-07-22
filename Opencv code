@@ -1,0 +1,158 @@
+import cv2
+import numpy as np
+import requests
+import time
+from collections import deque
+
+ESP32_IP = “10.165.179.46”
+URL = f”http://{ESP32_IP}/control”
+
+FRAME_W = 640
+FRAME_H = 480
+
+MARKER_SIZE_CM = 3.0
+INSET_CM = 1.0
+
+CENTER_TOL = 10
+SEND_INTERVAL = 0.12
+STABLE_FRAMES = 6
+MIN_AREA = 500
+
+LEFT_ROI = (0, 120, 190, 430)
+RIGHT_ROI = (450, 120, 640, 430)
+TOP_ROI = (170, 0, 470, 170)
+
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+
+x_history = deque(maxlen=5)
+last_send_time = 0
+last_sent_error = None
+stable_center_count = 0
+
+def send_error(error_value):
+    global last_send_time, last_sent_error
+    now = time.time()
+    if error_value == last_sent_error and now – last_send_time < SEND_INTERVAL:
+        return
+    try:
+        requests.get(URL, params={“error”: error_value}, timeout=0.5)
+        last_send_time = now
+        last_sent_error = error_value
+    except requests.RequestException:
+        pass
+
+def largest_dark_box(thresh, roi):
+    x1, y1, x2, y2 = roi
+    crop = thresh[y1:y2, x1:x2]
+    contours, _ = cv2.findContours(crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best = None
+    best_area = 0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < MIN_AREA:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w < 15 or h < 15:
+            continue
+        if area > best_area:
+            best_area = area
+            best = (x + x1, y + y1, w, h)
+    return best
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    h, w = frame.shape[:2]
+    frame_center_x = w // 2
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blur, 90, 255, cv2.THRESH_BINARY_INV)
+
+    kernel = np.ones((5, 5), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+    left_box = largest_dark_box(thresh, LEFT_ROI)
+    right_box = largest_dark_box(thresh, RIGHT_ROI)
+    top_box = largest_dark_box(thresh, TOP_ROI)
+
+    display = frame.copy()
+    cv2.line(display, (frame_center_x, 0), (frame_center_x, h), (255, 255, 0), 2)
+
+    if left_box:
+        lx, ly, lw, lh = left_box
+        cv2.rectangle(display, (lx, ly), (lx + lw, ly + lh), (0, 255, 0), 2)
+
+    if right_box:
+        rx, ry, rw, rh = right_box
+        cv2.rectangle(display, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 2)
+
+    if top_box:
+        tx, ty, tw, th = top_box
+        cv2.rectangle(display, (tx, ty), (tx + tw, ty + th), (255, 255, 0), 2)
+
+    if left_box and right_box and top_box:
+        lx, ly, lw, lh = left_box
+        rx, ry, rw, rh = right_box
+        tx, ty, tw, th = top_box
+
+        avg_marker_px = (lw + rw + th) / 3.0
+        px_per_cm = avg_marker_px / MARKER_SIZE_CM
+        inset_px = int(px_per_cm * INSET_CM)
+        left_inner_x = lx + lw
+        right_inner_x = rx
+        top_inner_y = ty + th
+
+        port_center_x = ((left_inner_x + inset_px) + (right_inner_x – inset_px)) // 2
+        port_center_y = top_inner_y + inset_px
+
+        x_history.append(port_center_x)
+        smooth_x = int(sum(x_history) / len(x_history))
+        error_x = smooth_x – frame_center_x
+
+        if abs(error_x) <= CENTER_TOL:
+            stable_center_count += 1
+        else:
+            stable_center_count = 0
+
+        if stable_center_count >= STABLE_FRAMES:
+            send_error(0)
+            status = “ALIGNED”
+        else:
+            send_error(error_x)
+            status = “LEFT” if error_x < 0 else “RIGHT”
+
+        cv2.line(display, (left_inner_x, 0), (left_inner_x, h), (0, 255, 0), 2)
+        cv2.line(display, (right_inner_x, 0), (right_inner_x, h), (0, 0, 255), 2)
+        cv2.line(display, (0, top_inner_y), (w, top_inner_y), (255, 255, 0), 2)
+       cv2.circle(display, (smooth_x, port_center_y), 8, (255, 0, 255), -1)
+        cv2.putText(display, f”px/cm: {px_per_cm:.1f}”, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(display, f”inset_px: {inset_px}”, (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(display, f”port_center_x: {smooth_x}”, (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+        cv2.putText(display, f”error_x: {error_x}”, (10, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(display, f”stable: {stable_center_count}”, (10, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(display, f”status: {status}”, (10, 180),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+   else:
+        stable_center_count = 0
+        send_error(9999)
+        cv2.putText(display, “Need left + right + top markers”, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    cv2.imshow(“3 Marker Inset Alignment”, display)
+    cv2.imshow(“Threshold”, thresh)
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+cap.release()
+cv2.destroyAllWindows()
+
